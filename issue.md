@@ -71,8 +71,6 @@ other parameter matches.
 
 ### Ablation
 
-All on the MSE wiring:
-
 | change                                 | result                                             |
 | -------------------------------------- | -------------------------------------------------- |
 | none (two chained cuDNN LSTMs)         | WRONG GRADS — only the first LSTM's `weight_hh_l0` |
