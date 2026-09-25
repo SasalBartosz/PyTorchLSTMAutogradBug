@@ -1,40 +1,43 @@
 """Minimal repro: compiled autograd gives a wrong encoder weight_hh gradient
-when a second cuDNN LSTM consumes the first LSTM's final state."""
+when a second cuDNN LSTM is chained after the first one."""
 
 import torch
 import torch.nn as nn
 from torch._dynamo import compiled_autograd
 from torch._dynamo.utils import same
 
+B, T, D = 2, 4, 8  # batch, timesteps, features
 
-def enc_grads(compiled, dtype=torch.float32, cudnn=True):
+
+def enc_weight_grads(compiled, dtype=torch.float32, cudnn=True):
     torch.backends.cudnn.enabled = cudnn
     torch.manual_seed(0)
-    enc = nn.LSTM(8, 8, 1, batch_first=True).to(device="cuda", dtype=dtype)
-    dec = nn.LSTM(8, 8, 1, batch_first=True).to(device="cuda", dtype=dtype)
-    x = torch.randn(4, 6, 8, device="cuda").to(dtype)  # same input values for all dtypes
-    y = torch.randn(4, 3, 8, device="cuda").to(dtype)
+    enc = nn.LSTM(D, D, batch_first=True).to(device="cuda", dtype=dtype)
+    dec = nn.LSTM(D, D, batch_first=True).to(device="cuda", dtype=dtype)
+    x = torch.randn(B, T, D, device="cuda").to(dtype)  # same input values for all dtypes
+    y = torch.randn(B, T, D, device="cuda").to(dtype)  # target
 
-    out, (h, c) = enc(x)
-    loss = out.square().sum() + dec(y, (h, c))[0].square().sum()  # decoder consumes final state
+    loss = nn.functional.mse_loss(dec(enc(x)[0])[0], y)  # two chained LSTMs
 
-    ctx = compiled_autograd._enable(torch.compile(dynamic=False)) if compiled else torch.enable_grad()
-    with ctx:
+    if compiled:
+        with compiled_autograd._enable(torch.compile(dynamic=False)):
+            loss.backward()
+    else:
         loss.backward()
-    return [p.grad.clone() for p in enc.parameters()]
+    return {n: p.grad.clone() for n, p in enc.named_parameters()}
 
 
 print(f"torch {torch.__version__}, cuDNN {torch.backends.cudnn.version()}, {torch.cuda.get_device_name()}")
 
-# fp64 baseline (cuDNN RNN is fp32/fp16-only, so this runs the native kernels)
-fp64 = enc_grads(compiled=False, dtype=torch.float64)
+fp64 = enc_weight_grads(False, torch.float64)  # fp64 reference (cuDNN RNN is fp32/fp16-only)
 
 for cudnn in (True, False):
-    eager = enc_grads(compiled=False, cudnn=cudnn)
-    ca = enc_grads(compiled=True, cudnn=cudnn)
-    ok = same(eager, ca, fp64_ref=fp64)
-    print(f"cudnn={cudnn}: {'OK' if ok else 'WRONG GRADS'}")
-    if not ok:
-        for n, e, c, r in zip(("w_ih", "w_hh", "b_ih", "b_hh"), eager, ca, fp64):
-            print(f"  {n}: |eager-fp64|max={ (e.double()-r).abs().max():.2e}  "
-                  f"|ca-fp64|max={(c.double()-r).abs().max():.2e}")
+    eager = enc_weight_grads(False, cudnn=cudnn)
+    ca = enc_weight_grads(True, cudnn=cudnn)
+    if same(eager, ca, fp64_ref=fp64, log_error=lambda *a, **k: None):
+        print(f"cudnn={cudnn}: OK")
+    else:
+        g = "weight_hh_l0"  # the only wrong gradient
+        e_err = (eager[g].double() - fp64[g]).abs().max()
+        ca_err = (ca[g].double() - fp64[g]).abs().max()
+        print(f"cudnn={cudnn}: WRONG GRADS in {g}: |grad-fp64|max = {ca_err:.1e} (eager: {e_err:.1e})")

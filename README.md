@@ -16,11 +16,7 @@ uv run python minimal_repro.py
 Expected output (torch 2.14.0+cu130, cuDNN 9.24.0):
 
 ```
-cudnn=True: WRONG GRADS
-  w_ih: |eager-fp64|max=1.06e-03  |ca-fp64|max=1.06e-03
-  w_hh: |eager-fp64|max=1.69e-04  |ca-fp64|max=2.39e-01
-  b_ih: |eager-fp64|max=3.72e-04  |ca-fp64|max=3.72e-04
-  b_hh: |eager-fp64|max=3.72e-04  |ca-fp64|max=3.72e-04
+cudnn=True: WRONG GRADS in weight_hh_l0: |grad-fp64|max = 5.9e-04 (eager: 3.3e-07)
 cudnn=False: OK
 ```
 
