@@ -1,5 +1,5 @@
-"""Minimal repro: compiled autograd gives a wrong encoder weight_hh gradient
-when a second cuDNN LSTM is chained after the first one."""
+"""Minimal repro: compiled autograd gives a wrong encoder weight_hh_l0 gradient
+when its output sequence is consumed by a second cuDNN LSTM."""
 
 import torch
 import torch.nn as nn
@@ -27,9 +27,12 @@ def enc_weight_grads(compiled, dtype=torch.float32, cudnn=True):
     return {n: p.grad.clone() for n, p in enc.named_parameters()}
 
 
-print(f"torch {torch.__version__}, cuDNN {torch.backends.cudnn.version()}, {torch.cuda.get_device_name()}")
+print(
+    f"torch {torch.__version__}, cuDNN {torch.backends.cudnn.version()}, "
+    f"{torch.cuda.get_device_name()}"
+)
 
-fp64 = enc_weight_grads(False, torch.float64)  # fp64 reference (cuDNN RNN is fp32/fp16-only)
+fp64 = enc_weight_grads(False, torch.float64)  # fp64 reference
 
 for cudnn in (True, False):
     eager = enc_weight_grads(False, cudnn=cudnn)
@@ -40,4 +43,7 @@ for cudnn in (True, False):
         g = "weight_hh_l0"  # the only wrong gradient
         e_err = (eager[g].double() - fp64[g]).abs().max()
         ca_err = (ca[g].double() - fp64[g]).abs().max()
-        print(f"cudnn={cudnn}: WRONG GRADS in {g}: |grad-fp64|max = {ca_err:.1e} (eager: {e_err:.1e})")
+        print(
+            f"cudnn={cudnn}: WRONG GRADS in {g}: "
+            f"|grad-fp64|max = {ca_err:.1e} (eager: {e_err:.1e})"
+        )

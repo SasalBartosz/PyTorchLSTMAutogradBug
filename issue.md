@@ -1,19 +1,24 @@
-# Draft: GitHub issue for pytorch/pytorch
+# Title
+
+[compiled autograd] Chained cuDNN LSTMs silently produce a wrong weight_hh_l0 gradient
 
 ## 🐛 Describe the bug
 
-Under compiled autograd (`torch._dynamo.compiled_autograd._enable(...)`), an encoder LSTM's
-backward silently returns a wrong gradient for one parameter: the last layer's
-`weight_hh`, no exception or warning is generated and all the other gradients match eager
+When the output sequence of one cuDNN LSTM is passed to a second cuDNN LSTM,
+compiled autograd silently returns a wrong `weight_hh_l0` gradient for the first
+LSTM. No exception or warning is emitted. Every other parameter gradient matches
+eager.
 
 Three conditions must all hold:
 
-1. LSTM runs on cuDNN (`torch.backends.cudnn.enabled = False` → all gradients correct).
-2. A second cuDNN LSTM is chained after it, so gradients flow between the
-   two backward nodes.
-3. Backward runs under compiled autograd. Without it, gradients match eager to fp32 noise.
+1. The LSTMs run on cuDNN (`torch.backends.cudnn.enabled = False` makes every
+   gradient correct).
+2. A second cuDNN LSTM consumes the first LSTM's output, so gradients flow between
+   the two backward nodes.
+3. Backward runs under compiled autograd. Ordinary eager backward remains close to
+   the fp64 reference.
 
-### Minimal repro
+### Minimal reproducer
 
 ```python
 import torch
@@ -21,16 +26,16 @@ import torch.nn as nn
 from torch._dynamo import compiled_autograd
 from torch._dynamo.utils import same
 
-B, T, F = 2, 4, 8  # batch, timesteps, features
+B, T, D = 2, 4, 8  # batch, timesteps, features
 
 
 def enc_weight_grads(compiled, dtype=torch.float32, cudnn=True):
     torch.backends.cudnn.enabled = cudnn
     torch.manual_seed(0)
-    enc = nn.LSTM(F, F, batch_first=True).to(device="cuda", dtype=dtype)
-    dec = nn.LSTM(F, F, batch_first=True).to(device="cuda", dtype=dtype)
-    x = torch.randn(B, T, F, device="cuda").to(dtype)
-    y = torch.randn(B, T, F, device="cuda").to(dtype)
+    enc = nn.LSTM(D, D, batch_first=True).to(device="cuda", dtype=dtype)
+    dec = nn.LSTM(D, D, batch_first=True).to(device="cuda", dtype=dtype)
+    x = torch.randn(B, T, D, device="cuda").to(dtype)
+    y = torch.randn(B, T, D, device="cuda").to(dtype)
 
     loss = nn.functional.mse_loss(dec(enc(x)[0])[0], y)
 
@@ -42,79 +47,131 @@ def enc_weight_grads(compiled, dtype=torch.float32, cudnn=True):
     return {n: p.grad.clone() for n, p in enc.named_parameters()}
 
 
-print(f"torch {torch.__version__}, cuDNN {torch.backends.cudnn.version()}, {torch.cuda.get_device_name()}")
+print(
+    f"torch {torch.__version__}, cuDNN {torch.backends.cudnn.version()}, "
+    f"{torch.cuda.get_device_name()}"
+)
 
 fp64 = enc_weight_grads(False, torch.float64)  # fp64 reference
 
 for cudnn in (True, False):
     eager = enc_weight_grads(False, cudnn=cudnn)
     ca = enc_weight_grads(True, cudnn=cudnn)
-    if same(eager, ca, fp64_ref=fp64):
+    if same(eager, ca, fp64_ref=fp64, log_error=lambda *a, **k: None):
         print(f"cudnn={cudnn}: OK")
     else:
         g = "weight_hh_l0"  # the only wrong gradient
         e_err = (eager[g].double() - fp64[g]).abs().max()
         ca_err = (ca[g].double() - fp64[g]).abs().max()
-        print(f"cudnn={cudnn}: WRONG GRADS in {g}: |grad-fp64|max = {ca_err:.1e} (eager: {e_err:.1e})")
+        print(
+            f"cudnn={cudnn}: WRONG GRADS in {g}: "
+            f"|grad-fp64|max = {ca_err:.1e} (eager: {e_err:.1e})"
+        )
 ```
 
-Output:
+### Observed output
 
-```
+PyTorch 2.14.0 stable:
+
+```text
 torch 2.14.0+cu130, cuDNN 92400, NVIDIA GeForce RTX 5070 Ti
 cudnn=True: WRONG GRADS in weight_hh_l0: |grad-fp64|max = 5.9e-04 (eager: 3.3e-07)
 cudnn=False: OK
 ```
 
-Compiled autograd's `weight_hh` error vs fp64 is ~1800x the eager fp32 error; every
-other parameter matches.
+The problem reproduces unchanged on the 2026-09-25 nightly, including the same
+error magnitudes:
 
-### Ablation
-
-| change                                 | result                                             |
-| -------------------------------------- | -------------------------------------------------- |
-| none (two chained cuDNN LSTMs)         | WRONG GRADS — only the first LSTM's `weight_hh_l0` |
-| `torch.backends.cudnn.enabled = False` | OK                                                 |
-| single LSTM (no decoder chained)       | OK                                                 |
-| backward without compiled autograd     | OK                                                 |
-| the second LSTM's own gradients        | always OK                                          |
-
-torch.compile backend/mode passed to `compiled_autograd._enable(...)`:
-
-| backend / mode                       | result      |
-| ------------------------------------ | ----------- |
-| `inductor` (default)                 | WRONG GRADS |
-| `aot_eager`                          | WRONG GRADS |
-| `eager`                              | WRONG GRADS |
-| `inductor`, `mode="reduce-overhead"` | WRONG GRADS |
-| `inductor`, `mode="max-autotune"`    | WRONG GRADS |
-
-## Expected behavior
-
-Compiled autograd matches eager gradients (within fp32 noise), or graph-breaks/errors instead of
-silently returning a wrong gradient.
-
-## Python environment
-
-Environment managed with [uv](https://docs.astral.sh/uv/). The exact `pyproject.toml` used
-(`uv.lock` in the gist; reproduce with `uv sync && uv run python minimal_repro.py`):
-
-```toml
-[project]
-name = "autogradbug"
-version = "0.1.0"
-description = ""
-readme = "README.md"
-requires-python = ">=3.12"
-dependencies = [
-    "numpy>=2.5.3",
-    "torch>=2.14.0",
-]
+```text
+torch 2.15.0.dev20260925+cu130, cuDNN 92600, NVIDIA GeForce RTX 5070 Ti
+cudnn=True: WRONG GRADS in weight_hh_l0: |grad-fp64|max = 5.9e-04 (eager: 3.3e-07)
+cudnn=False: OK
 ```
+
+Compiled autograd's `weight_hh_l0` maximum error against fp64 is about 1800 times
+the eager fp32 error. `torch._dynamo.utils.same` rejects that gradient using its
+default tolerance and fp64-reference accuracy check; every other parameter passes.
+
+### Ablations
+
+| Change | Result |
+| --- | --- |
+| None (two chained cuDNN LSTMs) | WRONG GRADS — only the first LSTM's `weight_hh_l0` |
+| `torch.backends.cudnn.enabled = False` | OK |
+| Single LSTM (no decoder chained) | OK |
+| Backward without compiled autograd | OK |
+| The second LSTM's own gradients | Always OK |
+
+On PyTorch 2.14.0, the result is independent of the compiler backend or Inductor
+mode passed to `compiled_autograd._enable(...)`:
+
+| Backend / mode | Result |
+| --- | --- |
+| `inductor` (default) | WRONG GRADS |
+| `aot_eager` | WRONG GRADS |
+| `eager` | WRONG GRADS |
+| `inductor`, `mode="reduce-overhead"` | WRONG GRADS |
+| `inductor`, `mode="max-autotune"` | WRONG GRADS |
+
+### Expected behavior
+
+Compiled autograd should match eager gradients within expected fp32 numerical
+error, or graph-break/error rather than silently returning a wrong gradient.
+
+### Reproducer environment
+
+The self-contained reproducer, `pyproject.toml`, and `uv.lock` are available at:
+https://github.com/SasalBartosz/PyTorchLSTMAutogradBug
+
+Stable reproduction:
+
+```sh
+uv sync
+uv run python minimal_repro.py
+```
+
+One-off nightly reproduction:
+
+```sh
+uv run --isolated --no-project --python 3.12 \
+  --with torch --with numpy \
+  --prerelease allow \
+  --index pytorch-nightly=https://download.pytorch.org/whl/nightly/cu130 \
+  python minimal_repro.py
+```
+
+### Related reports
+
+- https://github.com/pytorch/pytorch/issues/82577 discusses how monolithic cuDNN
+  RNN operations and saved buffers complicate AOTAutograd, but does not report
+  incorrect gradients.
+- https://github.com/pytorch/pytorch/issues/158131 reports a different
+  `_cudnn_rnn.default` compilation/fake-tensor failure, not compiled-autograd
+  gradient corruption.
+
+I found no issue or pull request reporting this exact failure mode as of
+2026-09-25.
+
+### AI assistance disclosure
+
+The issue was found, when i was running benchmarks on the LSTM layers implementation through an agent, and it spotted this bug which made me look into it and produce a reproducible test, i confirm that i ran the benchmarks and confirmed the information specified here
+
+
+## Error logs
+
+No exception or warning is emitted. This is a silent correctness failure; the
+observed output is included above.
 
 ## Versions
 
-```
+The issue reproduces on both:
+
+- PyTorch `2.14.0+cu130`, cuDNN `9.24.0`
+- PyTorch nightly `2.15.0.dev20260925+cu130`, cuDNN `9.26.0`
+
+Stable environment (`collect_env.py`):
+
+```text
 PyTorch version: 2.14.0+cu130
 Is debug build: False
 CUDA used to build PyTorch: 13.0
