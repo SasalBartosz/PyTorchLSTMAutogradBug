@@ -88,6 +88,10 @@ cudnn=True: WRONG GRADS in weight_hh_l0: |grad-fp64|max = 5.9e-04 (eager: 3.3e-0
 cudnn=False: OK
 ```
 
+The attached full tlparse archive was generated from this nightly run. It shows
+a graph break at `aten._cudnn_rnn_backward.default` because no fake implementation
+is registered; execution nevertheless completes and returns the wrong gradient.
+
 Compiled autograd's `weight_hh_l0` maximum error against fp64 is about 1800 times
 the eager fp32 error. `torch._dynamo.utils.same` rejects that gradient using its
 default tolerance and fp64-reference accuracy check; every other parameter passes.
@@ -116,7 +120,8 @@ mode passed to `compiled_autograd._enable(...)`:
 ### Expected behavior
 
 Compiled autograd should match eager gradients within expected fp32 numerical
-error, or graph-break/error rather than silently returning a wrong gradient.
+error. If it cannot safely compile the cuDNN RNN backward, it should fall back
+correctly or raise an error rather than return an incorrect gradient.
 
 ### Reproducer environment
 
@@ -154,8 +159,13 @@ I found no issue or pull request reporting this exact failure mode as of
 
 ### AI assistance disclosure
 
-The issue was found, when i was running benchmarks on the LSTM layers implementation through an agent, and it spotted this bug which made me look into it and produce a reproducible test, i confirm that i ran the benchmarks and confirmed the information specified here
+> - **Tool:** AI coding agent
+> - **Scope:** The agent helped surface the discrepancy during LSTM benchmarking,
+>   minimize the reproducer, search for related reports, and organize/edit this issue.
 
+I personally ran and verified the stable and nightly reproductions, ablations,
+environment details, and attached trace. I reviewed the report and take
+responsibility for its contents.
 
 ## Error logs
 
